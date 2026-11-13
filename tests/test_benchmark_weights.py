@@ -105,6 +105,26 @@ def test_nav_reconciles_overnight_rebalance_adjusted_prices_and_split_requests()
     assert len(missing.nav) == 1
 
 
+def test_suspended_dividend_offsets_mark_once_and_survives_resume_without_rebalance():
+    days = ["2024-07-18", "2024-07-25", "2024-07-26", "2024-07-29"]
+    code = "600027.SH"
+    membership = _daily_members(days, (code,))
+    bars = pd.DataFrame([_bar(days[0], code, 6.08, 6.08), _bar(days[3], code, 6.2, 5.54)])
+    status = pd.DataFrame({"trade_date": days[1:3], "ts_code": code, "is_suspended": True})
+    dividend = pd.DataFrame({
+        "trade_date": [days[1]], "ts_code": code, "adjusted_cash_per_share": 0.15,
+    })
+    result = monthly_equal_weight_benchmark(
+        membership, bars, status, expected_members=1, suspended_dividends=dividend,
+    )
+    assert result.audit.ready.all()
+    nav = result.nav
+    np.testing.assert_allclose(nav.nav, [1, 1, 1, (5.54 + 0.15) / 6.08])
+    np.testing.assert_allclose(nav.dividend_cash, [0, 0.15 / 6.08, 0, 0])
+    assert nav.cash.iloc[-1] == pytest.approx(0.15 / 6.08)
+    assert nav.overnight_pnl.iloc[-1] == pytest.approx((6.2 - 5.93) / 6.08)
+
+
 def test_equal_weight_rebalances_next_month_then_drifts_with_returns() -> None:
     days = ["2024-01-31", "2024-02-01", "2024-02-02"]
     membership = _daily_members(days)

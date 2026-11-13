@@ -39,12 +39,15 @@ def monthly_equal_weight_benchmark(
     suspensions: pd.DataFrame | None = None,
     *,
     expected_members: int = 300,
+    suspended_dividends: pd.DataFrame | None = None,
 ) -> EqualWeightBenchmarkBuild:
     """Build end-of-day weights for a monthly equal-weight simulated market.
 
     Signals are dated at the preceding close; bootstrap has no signal date.
     A suspension defers the entire rebalance, retaining old holdings until retry.
     Unexplained missing prices block the day and invalidate subsequent drift.
+    Suspended dividends use cash per adjusted share on the same scale as bars.
+    Subsequent bars must exclude those dividends from their adjustment factor.
     """
     required_membership = {"trade_date", "ts_code"}
     required_bars = {"trade_date", "ts_code", "adj_open", "adj_close"}
@@ -94,6 +97,15 @@ def monthly_equal_weight_benchmark(
             for row in status.loc[status["is_suspended"].fillna(False).astype(bool)].itertuples(index=False)
         )
 
+    dividends = {}
+    if suspended_dividends is not None:
+        for row in suspended_dividends.itertuples(index=False):
+            key = (pd.Timestamp(row.trade_date).normalize(), row.ts_code)
+            amount = float(row.adjusted_cash_per_share)
+            if key not in suspended or key in dividends or not isfinite(amount) or amount <= 0:
+                raise ValueError(f"Invalid suspended dividend: {key}")
+            dividends[key] = amount
+
     weight_columns = ["trade_date", "ts_code", "weight", "source", "methodology"]
     audit_columns = [
         "trade_date",
@@ -113,6 +125,7 @@ def monthly_equal_weight_benchmark(
     previous_weights: pd.Series | None = None
     last_closes: dict[str, float] = {}
     pending_rebalance = False
+    cash_weight = 0.0
     nav = 1.0
     nav_rows = []
 
@@ -150,16 +163,25 @@ def monthly_equal_weight_benchmark(
         overnight = 1.0
         executes = rebalance and not blocked_rebalance
         open_factors = {}
+        dividend_weight = 0.0
         for code in held_codes:
             row = price_rows.get((trade_date, code))
             if (trade_date, code) in suspended:
                 open_factors[code] = 1.0
+                if amount := dividends.get((trade_date, code)):
+                    mark = last_closes.get(code, 0.0)
+                    if not 0 < amount < mark:
+                        raise ValueError(f"Dividend exceeds or lacks prior mark: {trade_date}, {code}")
+                    last_closes[code] = mark - amount
+                    dividend_weight += float(previous_weights[code]) * amount / mark
+                    open_factors[code] = (mark - amount) / mark
             elif row is not None and isfinite(row.adj_open) and row.adj_open > 0 and code in last_closes:
                 open_factors[code] = row.adj_open / last_closes[code]
             else:
                 missing_prices.append(code)
         if previous_weights is not None and not missing_prices:
             overnight = float(previous_weights.dot(pd.Series(open_factors).reindex(previous_weights.index)))
+            overnight += cash_weight + dividend_weight
         unknown_signal = (
             membership_rebalance and "available_at" in daily_members
             and (daily_members["available_at"].isna()
@@ -176,6 +198,7 @@ def monthly_equal_weight_benchmark(
         elif not rebalance and previous_weights is None:
             reason = "missing_prior_weights"
         else:
+            open_cash_weight = 0.0 if executes else (cash_weight + dividend_weight) / overnight
             base = (
                 pd.Series(1.0 / expected_members, index=codes, dtype=float)
                 if rebalance and not blocked_rebalance
@@ -203,12 +226,13 @@ def monthly_equal_weight_benchmark(
                 previous_weights = None
             else:
                 drifted = base * factors
-                total = float(drifted.sum())
+                total = float(drifted.sum()) + open_cash_weight
                 if total <= 0 or not isfinite(total):
                     reason = "invalid_weight_sum"
                     previous_weights = None
                 else:
                     previous_weights = drifted / total
+                    cash_weight = open_cash_weight / total
                     reason = "ready"
                     if nav is not None:
                         open_nav = nav * overnight
@@ -217,6 +241,8 @@ def monthly_equal_weight_benchmark(
                             "trade_date": trade_date.date(), "previous_nav": nav,
                             "open_nav": open_nav, "overnight_pnl": open_nav - nav,
                             "intraday_pnl": close_nav - open_nav, "nav": close_nav,
+                            "dividend_cash": nav * dividend_weight,
+                            "cash": close_nav * cash_weight,
                             "rebalanced": executes,
                         })
                         nav = close_nav
@@ -262,7 +288,8 @@ def monthly_equal_weight_benchmark(
         audit=pd.DataFrame(audit_rows, columns=audit_columns),
         rebalances=pd.DataFrame(rebalance_rows),
         nav=pd.DataFrame(nav_rows, columns=[
-            "trade_date", "previous_nav", "open_nav", "overnight_pnl", "intraday_pnl", "nav", "rebalanced",
+            "trade_date", "previous_nav", "open_nav", "overnight_pnl", "intraday_pnl", "nav",
+            "rebalanced", "dividend_cash", "cash",
         ]),
     )
 
