@@ -1,5 +1,6 @@
 """Build a local research-only factor ledger from unadjusted BaoStock quotes."""
 from math import isfinite
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -11,7 +12,27 @@ KEY = ["trade_date", "ts_code"]
 FIELDS = ["open", "close", "pre_close", "volume"]
 
 
-def simulate(required, raw):
+def backfill_tasks(issues, members, days):
+    member_keys = set(members[KEY].itertuples(index=False, name=None))
+    following = dict(zip(days[:-1], days[1:]))
+    sale_keys = {
+        (following[day], code) for day, code in member_keys
+        if day in following and (following[day], code) not in member_keys
+    }
+    tasks = issues.loc[issues.reason.ne("prior_gap_blocks_factor_chain")].copy()
+    keys = list(tasks[KEY].itertuples(index=False, name=None))
+    tasks["warmup"] = tasks.trade_date.lt("2024-01-01")
+    tasks["member_on_date"] = [key in member_keys for key in keys]
+    tasks["exit_open_required"] = [key in sale_keys for key in keys]
+    tasks["action"] = tasks.reason.map({
+        "missing_quote_no_suspension_evidence": "backfill_quote",
+        "no_positive_volume_no_suspension_evidence": "verify_full_day_suspension",
+    }).fillna("review_quote")
+    tasks["suspension_confirmed"] = False
+    return tasks.sort_values(["ts_code", "trade_date"])
+
+
+def simulate(required, raw, confirmed=frozenset()):
     unique = raw.drop_duplicates(KEY + FIELDS)
     conflicts = unique.duplicated(KEY, keep=False)
     quotes = unique.loc[~conflicts].assign(has_quote=True)
@@ -22,6 +43,12 @@ def simulate(required, raw):
         factor, prior_close, prior_date, broken = 1.0, None, None, False
         for row in rows.itertuples(index=False):
             reason = None
+            if (row.trade_date, code) in confirmed:
+                if pd.notna(row.conflict) or (pd.notna(row.volume) and row.volume > 0):
+                    issues.append({"trade_date": row.trade_date, "ts_code": code,
+                                   "reason": "suspension_quote_conflict"})
+                    broken = True
+                continue
             if pd.notna(row.conflict):
                 reason = "conflicting_archive_quotes"
             elif pd.isna(row.has_quote):
@@ -83,23 +110,41 @@ def main():
         if previous.get(group.trade_date.min(), days[0]) <= day
         <= following.get(group.trade_date.max(), days[-1])
     ])
-    ledger, issues = simulate(required, raw)
     out = Path("data/exports/mq300-2024-simulated")
     out.mkdir(parents=True, exist_ok=True)
+    evidence = out / "suspension_evidence.json"
+    intervals = json.loads(evidence.read_text(encoding="utf-8")) if evidence.exists() else []
+    status = required.merge(pd.DataFrame(intervals), on="ts_code") if intervals else required.iloc[:0]
+    if intervals:
+        status = status.loc[status.trade_date.ge(status.start) & status.trade_date.lt(status.resume)]
+    confirmed = set(status[KEY].itertuples(index=False, name=None))
+    status.assign(is_suspended=True).to_json(out / "confirmed_suspensions.json", orient="records")
+    ledger, issues = simulate(required, raw, confirmed)
     ledger.to_json(out / "factors.json", orient="records", double_precision=15)
     issues.to_json(out / "anomalies.json", orient="records")
+    tasks = backfill_tasks(issues, members, days)
+    tasks.to_json(out / "backfill_tasks.json", orient="records")
+    for action, rows in tasks.groupby("action"):
+        rows.to_json(out / f"{action}.json", orient="records")
     valid_2024 = ledger.loc[ledger.trade_date.str.startswith("2024-")]
     issues_2024 = issues.loc[issues.trade_date.str.startswith("2024-")]
     membership_2024 = members.loc[members.trade_date.str.startswith("2024-"), KEY]
     member_issues = membership_2024.merge(issues_2024, on=KEY)
     summary = pd.Series({
         "source": SOURCE, "warmup_start": warmup[0], "warmup_end": warmup[-1],
+        "confirmed_suspension_keys": len(confirmed),
         "observed_2024_sessions": len(year_days),
         "factor_rows_2024": len(valid_2024),
         "factor_changes_2024": int(valid_2024.factor_step.ne(1).sum()),
         "anomalies_2024": issues_2024.reason.value_counts().to_dict(),
         "warmup_anomalies": issues.loc[~issues.trade_date.str.startswith("2024-")].reason.value_counts().to_dict(),
         "member_anomalies_2024": member_issues.reason.value_counts().to_dict(),
+        "backfill_tasks": tasks.action.value_counts().to_dict(),
+        "backfill_warmup": tasks.loc[tasks.warmup, "action"].value_counts().to_dict(),
+        "backfill_exit_open": tasks.loc[tasks.exit_open_required, "action"].value_counts().to_dict(),
+        "backfill_2024_other": tasks.loc[
+            ~tasks.warmup & ~tasks.member_on_date & ~tasks.exit_open_required, "action"
+        ].value_counts().to_dict(),
         "independent_reference_close_validation": False,
         "nav_comparison": "not_run_data_not_accepted",
     })
