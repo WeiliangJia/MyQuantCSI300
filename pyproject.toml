@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myquant-csi300"
+version = "0.1.0"
+description = "Point-in-time daily CSI 300 index-enhancement research and paper-trading system"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "pandas>=2.2",
+  "SQLAlchemy>=2.0",
+  "psycopg[binary]>=3.1",
+  "pydantic-settings>=2.2",
+  "PyYAML>=6.0",
+  "typer>=0.12",
+  "tushare>=1.4.21",
+  "cvxpy>=1.5",
+  "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "ruff>=0.5"]
+free = ["baostock>=0.8.9", "akshare>=1.18"]
+pdf = ["pypdf>=5.0"]
+
+[project.scripts]
+myquant = "myquant.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

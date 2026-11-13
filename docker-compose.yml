@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: myquant
+      POSTGRES_USER: myquant
+      POSTGRES_PASSWORD: myquant
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myquant -d myquant"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+

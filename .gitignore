@@ -1,0 +1,29 @@
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+data/raw/
+data/exports/
+postgres_data/
+
+# Local-only source material and derived membership lists. These files may contain
+# copyrighted announcements, attachments, or complete CSI 300 constituent data and
+# must never be published by a broad `git add`.
+data/official/
+data/logs/
+data/reference/*
+!data/reference/official_membership/
+data/reference/official_membership/*
+!data/reference/official_membership/README.md
+!data/reference/official_membership/baseline_template.csv
+# Generated audits, workbooks, and previews stay local.
+/outputs/
+.tmp/
+tmp/
