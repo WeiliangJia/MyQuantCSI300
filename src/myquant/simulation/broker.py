@@ -86,7 +86,8 @@ class PaperBroker:
             return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "suspended_or_missing_open")
         if locked_limit:
             return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "locked_limit")
-        cap = int(math.floor((adv_volume or 0) * self.max_adv_participation / 100) * 100)
+        available_volume = adv_volume if adv_volume is not None and math.isfinite(adv_volume) else 0.0
+        cap = int(math.floor(available_volume * self.max_adv_participation / 100) * 100)
         quantity = min(requested_quantity, cap) if cap > 0 else 0
         if quantity == 0:
             return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "adv_participation_limit")
@@ -100,6 +101,8 @@ class PaperBroker:
         if side == "BUY":
             affordable = int(math.floor((self.cash - self.costs.minimum_commission) / price / 100) * 100)
             quantity = min(quantity, max(0, affordable))
+            while quantity and quantity * price + self.costs.fees(ts_code, side, quantity, price) > self.cash:
+                quantity -= 100
             fees = self.costs.fees(ts_code, side, quantity, price) if quantity else 0.0
             if quantity == 0:
                 return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "insufficient_cash")

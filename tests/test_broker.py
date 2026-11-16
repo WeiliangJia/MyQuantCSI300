@@ -25,3 +25,10 @@ def test_cash_dividend_is_credited_to_held_shares() -> None:
     broker.submit("2024-01-02", "000001.SZ", "BUY", 1000, 10.0, 1_000_000)
     credited = broker.apply_cash_dividend("000001.SZ", 0.2)
     assert credited == 200.0
+
+
+def test_buy_quantity_reserves_actual_commission() -> None:
+    broker = PaperBroker(cash=100_600, max_adv_participation=1.0)
+    fill = broker.submit("2024-01-02", "000001.SZ", "BUY", 1000, 100.53, 100_000)
+    assert fill.filled_quantity == 900
+    assert broker.cash >= 0

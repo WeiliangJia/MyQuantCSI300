@@ -26,11 +26,23 @@ class FreeFloatWeightBuild:
 
 
 @dataclass(frozen=True)
+class EqualWeightReplayState:
+    trade_date: pd.Timestamp
+    members: frozenset[str]
+    weights: dict[str, float]
+    last_closes: dict[str, float]
+    pending_rebalance: bool
+    cash_weight: float
+    nav: float
+
+
+@dataclass(frozen=True)
 class EqualWeightBenchmarkBuild:
     weights: pd.DataFrame
     audit: pd.DataFrame
     rebalances: pd.DataFrame
     nav: pd.DataFrame
+    closing_state: EqualWeightReplayState | None = None
 
 
 def monthly_equal_weight_benchmark(
@@ -40,6 +52,7 @@ def monthly_equal_weight_benchmark(
     *,
     expected_members: int = 300,
     suspended_dividends: pd.DataFrame | None = None,
+    initial_state: EqualWeightReplayState | None = None,
 ) -> EqualWeightBenchmarkBuild:
     """Build end-of-day weights for a monthly equal-weight simulated market.
 
@@ -48,6 +61,7 @@ def monthly_equal_weight_benchmark(
     Unexplained missing prices block the day and invalidate subsequent drift.
     Suspended dividends use cash per adjusted share on the same scale as bars.
     Subsequent bars must exclude those dividends from their adjustment factor.
+    A continuation starts strictly after the supplied closing state.
     """
     required_membership = {"trade_date", "ts_code"}
     required_bars = {"trade_date", "ts_code", "adj_open", "adj_close"}
@@ -127,6 +141,16 @@ def monthly_equal_weight_benchmark(
     pending_rebalance = False
     cash_weight = 0.0
     nav = 1.0
+    if initial_state is not None:
+        if members.empty or members["trade_date"].min() <= initial_state.trade_date:
+            raise ValueError("Continuation dates must follow the closing state")
+        previous_date = initial_state.trade_date
+        previous_members = set(initial_state.members)
+        previous_weights = pd.Series(initial_state.weights, dtype=float)
+        last_closes = initial_state.last_closes.copy()
+        pending_rebalance = initial_state.pending_rebalance
+        cash_weight = initial_state.cash_weight
+        nav = initial_state.nav
     nav_rows = []
 
     for trade_date, daily_members in members.groupby("trade_date", sort=True):
@@ -164,7 +188,7 @@ def monthly_equal_weight_benchmark(
         executes = rebalance and not blocked_rebalance
         open_factors = {}
         dividend_weight = 0.0
-        for code in held_codes:
+        for code in sorted(held_codes):
             row = price_rows.get((trade_date, code))
             if (trade_date, code) in suspended:
                 open_factors[code] = 1.0
@@ -283,6 +307,17 @@ def monthly_equal_weight_benchmark(
         previous_date = trade_date
         previous_members = current_members
 
+    closing_state = None
+    if nav is not None and previous_date is not None and previous_weights is not None:
+        closing_state = EqualWeightReplayState(
+            trade_date=previous_date,
+            members=frozenset(previous_members),
+            weights=previous_weights.to_dict(),
+            last_closes={code: last_closes[code] for code in previous_weights.index},
+            pending_rebalance=pending_rebalance,
+            cash_weight=cash_weight,
+            nav=nav,
+        )
     return EqualWeightBenchmarkBuild(
         weights=pd.DataFrame(weight_rows, columns=weight_columns),
         audit=pd.DataFrame(audit_rows, columns=audit_columns),
@@ -291,6 +326,7 @@ def monthly_equal_weight_benchmark(
             "trade_date", "previous_nav", "open_nav", "overnight_pnl", "intraday_pnl", "nav",
             "rebalanced", "dividend_cash", "cash",
         ]),
+        closing_state=closing_state,
     )
 
 

@@ -22,8 +22,9 @@ def is_weekly_signal_day(trade_dates: pd.Series) -> pd.Series:
 class WeeklyOpenBacktester:
     """Turns pre-approved weekly target weights into point-in-time daily paper fills."""
 
-    def __init__(self, broker: PaperBroker) -> None:
+    def __init__(self, broker: PaperBroker, *, block_open_at_limit: bool = False) -> None:
         self.broker = broker
+        self.block_open_at_limit = block_open_at_limit
 
     def run(
         self,
@@ -58,6 +59,10 @@ class WeeklyOpenBacktester:
                 latest_targets = scheduled.set_index("ts_code")["target_weight"]
                 self._rebalance(date_string, daily, latest_targets, fills)
             closes = daily.set_index("ts_code")["close"].to_dict()
+            missing = [code for code, position in self.broker.positions.items()
+                       if position.quantity and (code not in closes or not np.isfinite(closes[code]))]
+            if missing:
+                raise ValueError(f"{date_string}: missing close for holdings {missing}")
             equity = self.broker.cash + self.broker.market_value(closes)
             nav_rows.append({"trade_date": day, "nav": equity, "cash": self.broker.cash, "market_value": equity - self.broker.cash})
         return BacktestResult(pd.DataFrame(nav_rows), pd.DataFrame(fills))
@@ -67,6 +72,7 @@ class WeeklyOpenBacktester:
         equity = self.broker.cash + self.broker.market_value(closes)
         all_codes = set(targets.index) | set(self.broker.positions)
         market_rows = daily.set_index("ts_code")
+        orders = []
         for code in sorted(all_codes):
             if code not in market_rows.index:
                 continue
@@ -77,7 +83,9 @@ class WeeklyOpenBacktester:
             if delta == 0:
                 continue
             side = "BUY" if delta > 0 else "SELL"
-            locked = self._locked_at_limit(row, side)
+            orders.append((side, code, delta, row))
+        for side, code, delta, row in sorted(orders, key=lambda order: order[0] != "SELL"):
+            locked = self._locked_at_limit(row, side, self.block_open_at_limit)
             fill = self.broker.submit(
                 trade_date, code, side, abs(delta), float(row["open"]), float(row.get("adv_volume", row.get("volume", 0))),
                 bool(row.get("suspended", False)), locked,
@@ -85,13 +93,16 @@ class WeeklyOpenBacktester:
             fills.append({"trade_date": trade_date, **fill.__dict__})
 
     @staticmethod
-    def _locked_at_limit(row: pd.Series, side: str) -> bool:
+    def _locked_at_limit(row: pd.Series, side: str, block_open_at_limit: bool = False) -> bool:
         if bool(row.get("locked_limit", False)):
             return True
         open_price = float(row["open"])
-        is_single_price = float(row.get("high", open_price)) == float(row.get("low", open_price)) == open_price
+        if not block_open_at_limit and not (
+            float(row.get("high", open_price)) == float(row.get("low", open_price)) == open_price
+        ):
+            return False
         if side == "BUY" and pd.notna(row.get("up_limit")):
-            return is_single_price and open_price >= float(row["up_limit"])
+            return open_price >= float(row["up_limit"])
         if side == "SELL" and pd.notna(row.get("down_limit")):
-            return is_single_price and open_price <= float(row["down_limit"])
+            return open_price <= float(row["down_limit"])
         return False

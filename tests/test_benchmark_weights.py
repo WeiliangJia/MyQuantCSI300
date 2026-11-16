@@ -97,9 +97,15 @@ def test_nav_reconciles_overnight_rebalance_adjusted_prices_and_split_requests()
     prefix = monthly_equal_weight_benchmark(
         members.loc[members.trade_date <= days[1]], bars, status, expected_members=2,
     )
+    assert prefix.closing_state is not None
     pd.testing.assert_frame_equal(prefix.nav, result.nav.iloc[:2])
-    second = monthly_equal_weight_benchmark(members, bars, status, expected_members=2)
-    pd.testing.assert_frame_equal(pd.concat([prefix.nav, second.nav.iloc[2:]]), result.nav)
+    suffix = monthly_equal_weight_benchmark(
+        members.loc[members.trade_date >= days[2]], bars.loc[bars.trade_date >= days[2]],
+        status, expected_members=2, initial_state=prefix.closing_state,
+    )
+    pd.testing.assert_frame_equal(
+        pd.concat([prefix.nav, suffix.nav], ignore_index=True), result.nav, check_exact=True,
+    )
     # A missing exit open invalidates NAV even when all incoming members have quotes.
     missing = monthly_equal_weight_benchmark(members, bars.drop(index=2), status, expected_members=2)
     assert len(missing.nav) == 1
@@ -117,6 +123,16 @@ def test_suspended_dividend_offsets_mark_once_and_survives_resume_without_rebala
     result = monthly_equal_weight_benchmark(
         membership, bars, status, expected_members=1, suspended_dividends=dividend,
     )
+    prefix = monthly_equal_weight_benchmark(
+        membership.iloc[:2], bars.iloc[:1], status.iloc[:1],
+        expected_members=1, suspended_dividends=dividend,
+    )
+    assert prefix.closing_state is not None and prefix.closing_state.cash_weight > 0
+    suffix = monthly_equal_weight_benchmark(
+        membership.iloc[2:], bars.iloc[1:], status.iloc[1:],
+        expected_members=1, initial_state=prefix.closing_state,
+    )
+    pd.testing.assert_frame_equal(suffix.nav, result.nav.iloc[2:].reset_index(drop=True), check_exact=True)
     assert result.audit.ready.all()
     nav = result.nav
     np.testing.assert_allclose(nav.nav, [1, 1, 1, (5.54 + 0.15) / 6.08])
@@ -248,6 +264,20 @@ def test_suspended_removed_member_is_held_until_it_can_be_sold() -> None:
     resumed = result.weights.loc[result.weights["trade_date"].eq(pd.Timestamp(days[2]).date())]
     assert set(deferred["ts_code"]) == {"000001.SZ", "000002.SZ"}
     assert set(resumed["ts_code"]) == {"000001.SZ", "000003.SZ"}
+    prefix = monthly_equal_weight_benchmark(
+        membership.loc[membership.trade_date < days[2]], bars.loc[bars.trade_date < days[2]],
+        status, expected_members=2,
+    )
+    assert prefix.closing_state is not None and prefix.closing_state.pending_rebalance
+    suffix = monthly_equal_weight_benchmark(
+        membership.loc[membership.trade_date == days[2]], bars.loc[bars.trade_date == days[2]],
+        expected_members=2, initial_state=prefix.closing_state,
+    )
+    for field in ("nav", "rebalances", "weights"):
+        full = getattr(result, field)
+        date_column = "execution_date" if field == "rebalances" else "trade_date"
+        expected = full.loc[full[date_column].eq(pd.Timestamp(days[2]).date())]
+        pd.testing.assert_frame_equal(getattr(suffix, field), expected.reset_index(drop=True), check_exact=True)
 
 
 def test_rebalance_targets_do_not_depend_on_execution_close() -> None:
