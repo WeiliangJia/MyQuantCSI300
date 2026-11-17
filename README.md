@@ -121,6 +121,16 @@ myquant build-equal-weight-benchmark 2022-01-01 2024-12-31
 新浪后复权因子及 BaoStock 台账。原始响应缓存在本地模拟因子目录，使用 `--offline` 可重跑。
 复权以相邻有效交易日的步长和反推参考价核对，并保留两家因子的数值差异。
 
+2024 年 12 月低波动、中期动量和短期反转使用同一套周频撮合规则和 MQ300.EW 基准。
+已有本地验收输入时，运行下列命令。第一条生成基准净值，第二条使用腾讯缓存核对 BaoStock
+补取的调出股行情。对照结果写入 `data/exports/mq300-2024-factor-comparison/`。
+
+```powershell
+python scripts/verify_mq300_2024.py --annual-nav
+python scripts/backtest_mq300_pilot_2024.py --backfill-exits
+python scripts/backtest_mq300_pilot_2024.py --compare
+```
+
 首次使用先运行 `myquant init-db` 创建新增的 `market.benchmark_rebalance` 审计表。
 该表保存信号日、执行日、开盘目标权重、是否执行及顺延原因。历史首日为初始化，信号日为空。
 目标不使用执行日收盘价；收盘价仅用于计算当日日终权重。为保持分段运行一致，构建会从已有成分历史起点回放。
