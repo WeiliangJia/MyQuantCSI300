@@ -54,6 +54,11 @@ def prepare_market(bars, status, warmup_start="2024-10-08", trading_days=None):
     quotes = archived_bars(quotes, extra_fields=("isST",))
     if trading_days is not None:
         quotes = pd.concat([quotes, exit_quotes(quotes, trading_days)], ignore_index=True)
+    return market_with_limits(quotes, status.loc[status.trade_date.ge(warmup_start)])
+
+
+def market_with_limits(quotes, status):
+    quotes = quotes.copy()
     if not quotes.isST.isin([0, 1]).all():
         raise ValueError("Missing BaoStock ST status")
     board = quotes.ts_code.str.startswith(("300", "301", "688"))
@@ -63,7 +68,7 @@ def prepare_market(bars, status, warmup_start="2024-10-08", trading_days=None):
     rate_pct = np.rint(rate * 100).astype("int64")
     quotes["up_limit"] = ((cents * (100 + rate_pct) + 50) // 100) / 100
     quotes["down_limit"] = ((cents * (100 - rate_pct) + 50) // 100) / 100
-    halted = status.loc[status.trade_date.ge(warmup_start), KEY].copy()
+    halted = status[KEY].copy()
     halted["trade_date"] = pd.to_datetime(halted.trade_date)
     market = pd.concat(
         [quotes.assign(suspended=False), halted.assign(suspended=True, volume=0)], ignore_index=True,
@@ -77,16 +82,19 @@ def prepare_market(bars, status, warmup_start="2024-10-08", trading_days=None):
     return market
 
 
-def weekly_targets(market, benchmark, strategy="low_volatility"):
+def weekly_scores(market, benchmark, strategy, start, warmup_days=()):
     days = benchmark.trade_date
     schedule = pd.DataFrame({
         "signal_date": days, "execution_date": days.shift(-1),
     }).loc[is_weekly_signal_day(days)]
-    schedule = schedule.loc[schedule.execution_date.between(START, END)]
+    schedule = schedule.loc[schedule.execution_date.between(start, END)]
     members = year_members(days).rename(columns={"trade_date": "signal_date"})
     members["signal_date"] = pd.to_datetime(members.signal_date)
     members = members.loc[pd.to_datetime(members.available_at).le(members.signal_date)]
-    closes = market.pivot(index="trade_date", columns="ts_code", values="adj_close").reindex(days)
+    history = pd.DatetimeIndex(warmup_days).union(pd.DatetimeIndex(days)).sort_values()
+    closes = market.pivot(index="trade_date", columns="ts_code", values="adj_close").reindex(
+        history.rename("trade_date"),
+    )
     if strategy == "low_volatility":
         score = -closes.pct_change(fill_method=None).rolling(20).std()
     elif strategy == "momentum":
@@ -95,12 +103,22 @@ def weekly_targets(market, benchmark, strategy="low_volatility"):
         score = -(closes / closes.shift(5) - 1)
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
-    scores = score.where(np.isfinite(score)).stack().rename("score").reset_index()
+    scores = score.stack(future_stack=True).rename("score").reset_index()
+    scores = scores.loc[np.isfinite(scores.score)]
     eligible = market.loc[~market.suspended & market.isST.eq(0), KEY]
     eligible = eligible.merge(scores, on=KEY, validate="one_to_one").rename(columns={"trade_date": "signal_date"})
     ranked = schedule.merge(members[["signal_date", "ts_code"]], on="signal_date").merge(
         eligible, on=["signal_date", "ts_code"], validate="one_to_one",
     )
+    return schedule, ranked
+
+
+def weekly_targets(market, benchmark, strategy="low_volatility", start=START, warmup_days=()):
+    schedule, ranked = weekly_scores(market, benchmark, strategy, start, warmup_days)
+    return select_targets(schedule, ranked)
+
+
+def select_targets(schedule, ranked):
     selected = ranked.sort_values(
         ["signal_date", "score", "ts_code"], ascending=[True, False, True],
     ).groupby("signal_date").head(HOLDINGS)
@@ -168,12 +186,15 @@ def backfill_exits(market, benchmark):
     temporary.replace(EXIT_MANIFEST)
 
 
-def run_strategy(market, benchmark, targets, actions):
+def run_strategy(market, benchmark, targets, actions, start=START, costs=None, *,
+                 cap_fill_at_limit=False, buffered_holdings=None, measure_risk=False):
     target_keys = pd.MultiIndex.from_frame(targets[["execution_date", "ts_code"]])
     if not target_keys.isin(pd.MultiIndex.from_frame(market[KEY])).all():
         raise ValueError("Missing next-open quote or confirmed suspension for a target")
-    broker = PaperBroker(cash=CAPITAL)
-    result = WeeklyOpenBacktester(broker, block_open_at_limit=True).run(market, targets, actions)
+    broker = PaperBroker(cash=CAPITAL, costs=costs)
+    result = WeeklyOpenBacktester(
+        broker, block_open_at_limit=True, cap_fill_at_limit=cap_fill_at_limit,
+    ).run(market, targets, actions, buffered_holdings=buffered_holdings, measure_risk=measure_risk)
     fills = result.fills.assign(trade_date=lambda frame: pd.to_datetime(frame.trade_date)).merge(
         targets[["execution_date", "signal_date"]].drop_duplicates().rename(
             columns={"execution_date": "trade_date"},
@@ -187,8 +208,8 @@ def run_strategy(market, benchmark, targets, actions):
     if not fills.signal_date.lt(fills.trade_date).all():
         raise ValueError("Execution must follow its weekly signal")
 
-    baseline = benchmark.loc[benchmark.trade_date.between(START, END)]
-    strategy = result.nav.loc[result.nav.trade_date.between(START, END)]
+    baseline = benchmark.loc[benchmark.trade_date.between(start, END)]
+    strategy = result.nav.loc[result.nav.trade_date.between(start, END)]
     nav = strategy.merge(baseline[["trade_date", "nav_baostock"]], on="trade_date", validate="one_to_one")
     if not nav.trade_date.equals(baseline.trade_date.reset_index(drop=True)) or (nav.cash < -1e-8).any():
         raise ValueError("Inconsistent benchmark calendar or negative cash")

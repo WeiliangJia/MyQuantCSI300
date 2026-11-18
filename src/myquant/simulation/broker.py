@@ -79,6 +79,7 @@ class PaperBroker:
         adv_volume: float | None,
         suspended: bool = False,
         locked_limit: bool = False,
+        price_band: tuple[float, float] | None = None,
     ) -> Fill:
         if requested_quantity <= 0:
             return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "non_positive_quantity")
@@ -97,6 +98,9 @@ class PaperBroker:
             if quantity == 0:
                 return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "t_plus_one_unsettled")
         price = self.costs.fill_price(open_price, side)
+        if price_band is not None:
+            lower, upper = price_band
+            price = min(max(price, lower), upper)
         fees = self.costs.fees(ts_code, side, quantity, price)
         if side == "BUY":
             affordable = int(math.floor((self.cash - self.costs.minimum_commission) / price / 100) * 100)
@@ -115,7 +119,8 @@ class PaperBroker:
         return Fill(ts_code, side, requested_quantity, quantity, price, fees, status)
 
     def market_value(self, closes: dict[str, float]) -> float:
-        return sum(self.position_quantity(code) * closes.get(code, 0.0) for code in self.positions)
+        return sum(position.quantity * closes.get(code, 0.0)
+                   for code, position in self.positions.items() if position.quantity)
 
     def apply_cash_dividend(self, ts_code: str, cash_per_share: float) -> float:
         """Credit a declared per-share cash dividend to all shares held on the record date."""
