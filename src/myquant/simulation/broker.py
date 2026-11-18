@@ -56,11 +56,19 @@ class Position:
 class PaperBroker:
     """A deliberately conservative daily-open A-share paper broker."""
 
-    def __init__(self, cash: float, costs: CostModel | None = None, max_adv_participation: float = 0.01) -> None:
+    def __init__(self, cash: float, costs: CostModel | None = None, max_adv_participation: float = 0.01,
+                 *, exchange_lots: bool = False) -> None:
         self.cash = cash
         self.costs = costs or CostModel()
         self.max_adv_participation = max_adv_participation
+        self.exchange_lots = exchange_lots
         self.positions: dict[str, Position] = {}
+
+    @staticmethod
+    def lot_quantity(ts_code: str, quantity: int) -> int:
+        if ts_code.startswith("688") and ts_code.endswith(".SH"):
+            return quantity if quantity >= 200 else 0
+        return quantity // 100 * 100
 
     def settle(self, trade_date: str) -> None:
         for position in self.positions.values():
@@ -88,7 +96,9 @@ class PaperBroker:
         if locked_limit:
             return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "locked_limit")
         available_volume = adv_volume if adv_volume is not None and math.isfinite(adv_volume) else 0.0
-        cap = int(math.floor(available_volume * self.max_adv_participation / 100) * 100)
+        cap = int(math.floor(available_volume * self.max_adv_participation))
+        if not self.exchange_lots:
+            cap = cap // 100 * 100
         quantity = min(requested_quantity, cap) if cap > 0 else 0
         if quantity == 0:
             return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "adv_participation_limit")
@@ -97,16 +107,27 @@ class PaperBroker:
             quantity = min(quantity, position.settled)
             if quantity == 0:
                 return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "t_plus_one_unsettled")
+        if self.exchange_lots and not (side == "SELL" and quantity == position.quantity):
+            quantity = self.lot_quantity(ts_code, quantity)
+        if quantity <= 0:
+            return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "below_order_lot")
         price = self.costs.fill_price(open_price, side)
         if price_band is not None:
             lower, upper = price_band
             price = min(max(price, lower), upper)
         fees = self.costs.fees(ts_code, side, quantity, price)
         if side == "BUY":
-            affordable = int(math.floor((self.cash - self.costs.minimum_commission) / price / 100) * 100)
+            affordable = int(math.floor((self.cash - self.costs.minimum_commission) / price))
+            step = 100
+            if self.exchange_lots and ts_code.startswith("688") and ts_code.endswith(".SH"):
+                step = 1
+            affordable = (self.lot_quantity(ts_code, max(0, affordable)) if self.exchange_lots
+                          else affordable // 100 * 100)
             quantity = min(quantity, max(0, affordable))
             while quantity and quantity * price + self.costs.fees(ts_code, side, quantity, price) > self.cash:
-                quantity -= 100
+                quantity = max(0, quantity - step)
+                if self.exchange_lots:
+                    quantity = self.lot_quantity(ts_code, quantity)
             fees = self.costs.fees(ts_code, side, quantity, price) if quantity else 0.0
             if quantity == 0:
                 return Fill(ts_code, side, requested_quantity, 0, None, 0.0, "REJECTED", "insufficient_cash")

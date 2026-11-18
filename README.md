@@ -165,6 +165,30 @@ python scripts/verify_mq300_v0_2024.py
 
 V0 使用 100 万元初始资金、20 只股票等权、98% 目标仓位和次日开盘模拟撮合。成交成本沿用历史回测口径，包含模拟佣金、税费、过户费和滑点。
 
+## V1 逐日研究账户
+
+V1 使用 1,000 万元虚拟资金。每周最后一个交易日收盘后取低波动、中期动量和短期反转的截面排名均值，按 80% 基准与 20% 前 50 等权分配股票仓位，目标仓位 98%。目标通过跟踪误差、行业、单股和换手检查后在下一个交易日开盘模拟成交。调出后的存量持仓继续估值并尝试退出。
+
+```powershell
+python scripts/backfill_mq300_paper_inputs.py --industry-2024
+python scripts/backfill_mq300_paper_inputs.py --payments-2024
+python scripts/replay_mq300_v1_2024.py
+```
+
+2024 回放使用已经验收的 MQ300.EW、BaoStock 归档及独立行情缓存。新增的 BaoStock 行业快照按查询日期向后生效。账户写入 `data/exports/mq300-v1-2024-paper/` 中的 SQLite 日账和 CSV，保留现金、持仓、信号、订单、费用及公司行动。`--through YYYY-MM-DD` 可在中间日期停止，同一输出目录再次运行会从已提交的会计日继续。改变成本或输入时用 `--output` 指定新的目录。
+
+订单逐笔分解券商佣金、经手费、证管费、过户费、卖出印花税、半价差及冲击，其中经手费和证管费已包含在假定的万三佣金（最低 5 元）内。半价差与冲击的场景参数各为 2 和 3 个基点，以分为单位调整模拟成交价格。分红先确认应收，再按已匹配的派息日入账，缺同额证据的分红逐笔标记为除息日结算假设。送转按除权日入账。`--monthly-cost` 和 `--dividend-tax-rate` 的默认情景值均为零，后者是固定有效税率假设。
+
+最近 120 个已收盘交易日可独立归档。结束日期按实际最后一个已收盘交易日填写：
+
+```powershell
+python scripts/backfill_mq300_paper_inputs.py --end 2026-11-17
+python scripts/backfill_mq300_paper_inputs.py --recent-payments 2026-11-17
+python scripts/backfill_mq300_paper_inputs.py --end 2026-11-17 --offline
+```
+
+最近窗口保存逐日供应商成分、报价、停牌状态、行业、派息送转日历、复权及涨跌停候选值和缺口清单。`coverage.json` 报告官方成分快照核对和前向放行所需的证据，`action_terms_pending.csv` 保存待复核的参考价变动。合并换股等事件也要单独验收。下载与回放产物均在本地忽略目录。
+
 ## 关键约束
 
 - 历史仓库从2005-04-08开始；2008年开始统计绩效。

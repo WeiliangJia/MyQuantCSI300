@@ -13,12 +13,12 @@ OUT = Path("data/exports/mq300-2024-simulated")
 URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 
 
-def calendar():
+def calendar(start="2023-12-01", end_exclusive="2025-01-01", dataset="sharebonus_calendar", columns="ALL"):
     params = {
-        "reportName": "RPT_SHAREBONUS_DET", "columns": "ALL",
+        "reportName": "RPT_SHAREBONUS_DET", "columns": columns,
         "pageSize": 500, "source": "WEB", "client": "WEB",
         "sortColumns": "EX_DIVIDEND_DATE,SECUCODE,REPORT_DATE", "sortTypes": "1,1,1",
-        "filter": "(EX_DIVIDEND_DATE>='2023-12-01')(EX_DIVIDEND_DATE<'2025-01-01')",
+        "filter": f"(EX_DIVIDEND_DATE>='{start}')(EX_DIVIDEND_DATE<'{end_exclusive}')",
     }
     archive = RawArchiver(get_settings().raw_archive_path)
     frames = []
@@ -30,7 +30,7 @@ def calendar():
             response.raise_for_status()
             result = response.json()["result"]
             frame = pd.DataFrame(result["data"])
-            archive.archive("sharebonus_calendar", query, frame, source="eastmoney")
+            archive.archive(dataset, query, frame, source="eastmoney")
             frames.append(frame)
             if page == 1:
                 count, pages = result["count"], result["pages"]
