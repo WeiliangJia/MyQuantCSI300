@@ -1,5 +1,6 @@
 """Daily account journal and explicit execution costs for MQ300 research replay."""
 
+from contextlib import closing, contextmanager
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_HALF_UP
 import json
@@ -70,12 +71,59 @@ def restore_broker(cash, positions, costs):
     return broker
 
 
+def _opening_budget(proposed, forced, costs, budget, broker):
+    """Scale each discretionary side at modeled fill prices, before lot rounding."""
+    notionals = {"BUY": 0.0, "SELL": 0.0}
+    for side, code, quantity, row in proposed:
+        if code not in forced and not row.suspended:
+            price = min(max(costs.fill_price(float(row.open), side), row.down_limit), row.up_limit)
+            notionals[side] += quantity * price
+    limited = []
+    for side, code, quantity, row in proposed:
+        if code not in forced and not row.suspended and notionals[side] > budget:
+            quantity = broker.lot_quantity(code, math.floor(quantity * budget / notionals[side]))
+        if quantity:
+            limited.append((side, code, quantity, row))
+    return limited
+
+
 def book_session(day, quotes, member_codes, target, actions, previous, costs, initial_cash,
-                 fixed_cost, dividend_tax_rate):
+                 fixed_cost, dividend_tax_rate, exchanges=(), turnover_cap=None):
     prior = previous["account"] if previous else {"cash": initial_cash, "market_value": 0.0, "nav_cny": initial_cash}
     broker = restore_broker(prior["cash"], previous["positions"] if previous else [], costs)
     broker.settle(day)
     journals, orders = [], []
+    pending = dict(previous.get("pending_exchanges", {})) if previous else {}
+    for event in exchanges:
+        old, new = event["old"], event["new"]
+        if old == new or old in member_codes or new not in quotes.index:
+            raise ValueError(f"{day}: inconsistent share exchange {old} -> {new}")
+        if event["kind"] == "convert":
+            ratio = Decimal(str(event["ratio"]))
+            if not ratio.is_finite() or ratio <= 0 or old in pending:
+                raise ValueError(f"{day}: invalid conversion terms")
+            quantity = broker.position_quantity(old)
+            if quantity:
+                del broker.positions[old]
+                exact = quantity * ratio
+                pending[old] = {"new": new, "quantity": int(exact)}
+                journals.append({"event": "exchange_entitlement", "ts_code": old, "successor": new,
+                                 "old_quantity": quantity, "new_quantity": int(exact),
+                                 "fraction_unallocated": str(exact - int(exact)), "cash_delta": 0.0})
+        elif event["kind"] == "release":
+            claim = pending.pop(old, None)
+            if claim:
+                if claim["new"] != new:
+                    raise ValueError(f"{day}: inconsistent successor")
+                broker.positions.setdefault(new, Position()).settled += claim["quantity"]
+                journals.append({"event": "exchange_listing", "ts_code": new, "old": old,
+                                 "shares": claim["quantity"], "cash_delta": 0.0})
+        else:
+            raise ValueError(f"Unknown exchange event {event['kind']}")
+    locked = {}
+    for claim in pending.values():
+        code = claim["new"]
+        locked[code] = locked.get(code, 0) + claim["quantity"]
     receivables = list(previous["receivables"]) if previous else []
     for action in actions:
         code = action["ts_code"]
@@ -109,7 +157,7 @@ def book_session(day, quotes, member_codes, target, actions, previous, costs, in
     broker.cash -= fixed_cost
     if broker.cash < -0.005:
         raise ValueError(f"{day}: available cash cannot cover fixed costs")
-    holdings = {code for code, position in broker.positions.items() if position.quantity}
+    holdings = {code for code, position in broker.positions.items() if position.quantity} | set(locked)
     forced = holdings - member_codes
     for code in holdings:
         if code not in quotes.index or not math.isfinite(quotes.at[code, "close"]) or quotes.at[code, "close"] <= 0:
@@ -120,7 +168,7 @@ def book_session(day, quotes, member_codes, target, actions, previous, costs, in
             opening = quotes.at[code, "open"]
             if not math.isfinite(opening) or opening <= 0:
                 raise ValueError(f"{day}: missing opening valuation for {code}")
-            open_equity += opening * broker.position_quantity(code)
+            open_equity += opening * (broker.position_quantity(code) + locked.get(code, 0))
         proposed = []
         for code in sorted((holdings | set(target)) if target is not None else forced):
             current = broker.position_quantity(code)
@@ -134,34 +182,47 @@ def book_session(day, quotes, member_codes, target, actions, previous, costs, in
             if not math.isfinite(opening) or opening <= 0:
                 raise ValueError(f"{day}: missing reference opening price for {code}")
             desired = int(open_equity * weight / opening)
-            difference = desired - current
+            difference = max(-current, desired - current - locked.get(code, 0))
             side = "BUY" if difference > 0 else "SELL"
             quantity = abs(difference) if desired == 0 else broker.lot_quantity(code, abs(difference))
             if quantity:
                 proposed.append((side, code, quantity, row))
+        if turnover_cap is not None:
+            # Both the opening and previous-close NAV conventions must satisfy the limit.
+            budget = math.floor(100 * turnover_cap * min(open_equity, prior["nav_cny"])) / 100
+            proposed = _opening_budget(proposed, forced, costs, budget, broker)
         for side, code, quantity, row in sorted(proposed, key=lambda order: order[0] == "BUY"):
             opening = float(row.open)
             if side == "BUY" and not row.suspended and row.isST != 0:
                 fill = Fill(code, side, quantity, 0, None, 0, "REJECTED", "st_or_missing_status")
             else:
                 band = None
-                locked = False
+                at_price_limit = False
                 if not row.suspended:
                     if not (math.isfinite(row.down_limit) and math.isfinite(row.up_limit)):
                         raise ValueError(f"{day}: missing price limits for {code}")
                     band = (float(row.down_limit), float(row.up_limit))
-                    locked = opening >= band[1] if side == "BUY" else opening <= band[0]
+                    at_price_limit = opening >= band[1] if side == "BUY" else opening <= band[0]
                 fill = broker.submit(day, code, side, quantity, opening, row.adv_volume,
-                                     bool(row.suspended), locked, price_band=band)
+                                     bool(row.suspended), at_price_limit, price_band=band)
             orders.append(costs.order_record(fill, opening, code in forced))
+        if turnover_cap is not None:
+            for side in ("BUY", "SELL"):
+                traded = sum(o["notional"] for o in orders if o["side"] == side and not o["forced_exit"])
+                if fen(traded) > budget:
+                    raise ValueError(f"{day}: {side} discretionary turnover exceeds the opening budget")
     positions = []
-    for code, position in sorted(broker.positions.items()):
-        if position.quantity:
+    for code in sorted(set(broker.positions) | set(locked)):
+        position = broker.positions.get(code, Position())
+        quantity = position.quantity + locked.get(code, 0)
+        if quantity:
             close = float(quotes.at[code, "close"])
             if not math.isfinite(close) or close <= 0:
                 raise ValueError(f"{day}: invalid closing valuation for {code}")
-            positions.append({"ts_code": code, "quantity": position.quantity, "close": close,
-                              "market_value": fen(position.quantity * close), **asdict(position)})
+            positions.append({"ts_code": code, "quantity": quantity, "close": close,
+                              "market_value": fen(quantity * close), **asdict(position)})
+            if code in locked:
+                positions[-1]["locked_quantity"] = locked[code]
 
     costs_today = {name: fen(sum(order.get(name, 0) for order in orders)) for name in COST_FIELDS}
     costs_today.update(fixed_cost=fixed_cost, dividend_tax=fen(tax))
@@ -185,12 +246,13 @@ def book_session(day, quotes, member_codes, target, actions, previous, costs, in
                     "buy_notional": buys, "sell_notional": sells,
                     "dividend_received": fen(paid), "fees": fees, "total_cost": total_cost, **costs_today},
         "positions": positions, "orders": orders, "actions": journals, "receivables": unpaid,
+        **({"pending_exchanges": pending} if pending else {}),
     }
 
 
-def save_sessions(database, fingerprint, days, step):
-    """Commit each session once, keeping orders and the resume state in the same transaction."""
-    with sqlite3.connect(database, isolation_level=None, timeout=30) as connection:
+@contextmanager
+def _journal(database, fingerprint):
+    with closing(sqlite3.connect(database, isolation_level=None, timeout=30)) as connection:
         connection.execute("CREATE TABLE IF NOT EXISTS run (id INTEGER PRIMARY KEY CHECK(id=1), fingerprint TEXT)")
         connection.execute("CREATE TABLE IF NOT EXISTS session (trade_date TEXT PRIMARY KEY, payload TEXT)")
         connection.execute("BEGIN IMMEDIATE")
@@ -198,23 +260,43 @@ def save_sessions(database, fingerprint, days, step):
             connection.execute("INSERT OR IGNORE INTO run VALUES (1, ?)", (fingerprint,))
             if connection.execute("SELECT fingerprint FROM run WHERE id=1").fetchone()[0] != fingerprint:
                 raise ValueError("Inputs or settings changed; choose a separate replay output directory")
+            yield connection
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
 
-        for day in days:
+
+def _commit_session(connection, day, step, digest=None):
+    with connection:
+        if not connection.in_transaction:
             connection.execute("BEGIN IMMEDIATE")
-            try:
-                if not connection.execute("SELECT 1 FROM session WHERE trade_date=?", (day,)).fetchone():
-                    row = connection.execute("SELECT payload FROM session ORDER BY trade_date DESC LIMIT 1").fetchone()
-                    previous = json.loads(row[0]) if row else None
-                    if previous and previous["trade_date"] >= day:
-                        raise ValueError("Cannot backdate a committed account")
-                    record = step(day, previous)
-                    connection.execute("INSERT INTO session VALUES (?, ?)", (day, json.dumps(record, allow_nan=False)))
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
+        saved = connection.execute("SELECT payload FROM session WHERE trade_date=?", (day,)).fetchone()
+        if saved:
+            record = json.loads(saved[0])
+            if digest is not None and record.get("input_sha256") != digest:
+                raise ValueError(f"{day}: input differs from the committed session")
+            return record, False
+        last = connection.execute("SELECT payload FROM session ORDER BY trade_date DESC LIMIT 1").fetchone()
+        previous = json.loads(last[0]) if last else None
+        if previous and previous["trade_date"] >= day:
+            raise ValueError("Cannot backdate a committed account")
+        record = step(day, previous)
+        if digest is not None:
+            record["input_sha256"] = digest
+        payload = json.dumps(record, allow_nan=False)
+        connection.execute("INSERT INTO session VALUES (?, ?)", (day, payload))
+        return json.loads(payload), True
+
+
+def save_one_session(database, fingerprint, day, step, digest):
+    with _journal(database, fingerprint) as connection:
+        return _commit_session(connection, day, step, digest)
+
+
+def save_sessions(database, fingerprint, days, step):
+    """Commit each session once, keeping orders and the resume state in the same transaction."""
+    with _journal(database, fingerprint) as connection:
+        for day in days:
+            _commit_session(connection, day, step)
         return [json.loads(row[0]) for row in connection.execute("SELECT payload FROM session ORDER BY trade_date")]

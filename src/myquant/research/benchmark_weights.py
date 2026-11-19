@@ -90,6 +90,15 @@ def monthly_equal_weight_benchmark(
         (row.trade_date, row.ts_code): row
         for row in prices.itertuples(index=False)
     }
+    # An illiquid conversion claim can have an observable successor price while
+    # still preventing a rebalance. Its marks drift until the shares are delivered.
+    locked_marks = set()
+    if "mark_locked" in prices:
+        marked = prices.loc[prices.mark_locked.eq(True)]
+        if not (marked.adj_open.gt(0) & marked.adj_close.gt(0)
+                & marked.adj_open.map(isfinite) & marked.adj_close.map(isfinite)).all():
+            raise ValueError("Missing successor valuation for a locked benchmark claim")
+        locked_marks = set(zip(marked.trade_date, marked.ts_code))
 
     suspended = set()
     if "is_suspended" in prices:
@@ -111,6 +120,8 @@ def monthly_equal_weight_benchmark(
             for row in status.loc[status["is_suspended"].fillna(False).astype(bool)].itertuples(index=False)
         )
 
+    if locked_marks - suspended:
+        raise ValueError("A locked benchmark claim must be marked untradable")
     dividends = {}
     if suspended_dividends is not None:
         for row in suspended_dividends.itertuples(index=False):
@@ -190,7 +201,7 @@ def monthly_equal_weight_benchmark(
         dividend_weight = 0.0
         for code in sorted(held_codes):
             row = price_rows.get((trade_date, code))
-            if (trade_date, code) in suspended:
+            if (trade_date, code) in suspended and (trade_date, code) not in locked_marks:
                 open_factors[code] = 1.0
                 if amount := dividends.get((trade_date, code)):
                     mark = last_closes.get(code, 0.0)
@@ -231,7 +242,7 @@ def monthly_equal_weight_benchmark(
             factors = pd.Series(1.0, index=codes, dtype=float)
             for code in codes:
                 row = price_rows.get((trade_date, code))
-                day_suspended = (trade_date, code) in suspended
+                day_suspended = (trade_date, code) in suspended and (trade_date, code) not in locked_marks
                 valid_open = row is not None and isfinite(row.adj_open) and row.adj_open > 0
                 valid_close = row is not None and isfinite(row.adj_close) and row.adj_close > 0
                 if valid_close:
@@ -292,7 +303,7 @@ def monthly_equal_weight_benchmark(
 
         for code in codes:
             row = price_rows.get((trade_date, code))
-            if (trade_date, code) not in suspended and row is not None and pd.notna(row.adj_close) and float(row.adj_close) > 0:
+            if ((trade_date, code) not in suspended or (trade_date, code) in locked_marks) and row is not None and pd.notna(row.adj_close) and float(row.adj_close) > 0:
                 last_closes[code] = float(row.adj_close)
         audit_rows.append({
             "trade_date": trade_date,

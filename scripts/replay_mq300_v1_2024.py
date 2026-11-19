@@ -15,6 +15,7 @@ from backtest_mq300_round_one_2024 import corporate_actions, independent_quotes,
 from reconcile_mq300_feeds_2024 import archived_bars
 from verify_mq300_2024 import checked_replay, exchange_days, local_inputs, year_members
 
+from myquant.simulation.paper_day import signal_targets
 from myquant.simulation.paper import COST_FIELDS, ResearchCosts2024, book_session, fen, save_sessions
 
 
@@ -92,54 +93,6 @@ def inputs(industry_path, payment_path):
         actions.loc[selected, "payment_evidence"] = "issuer_notice"
         actions.loc[selected, "payment_source_url"] = source
     return benchmark, base.weights, market, members, schedule, combined, risk_returns, industry, actions
-
-
-def signal_targets(scores, reference, returns, industry, quotes, members, record):
-    account = record["account"]
-    current = pd.Series({row["ts_code"]: row["market_value"] / account["nav_cny"]
-                         for row in record["positions"]}, dtype=float)
-    reference = reference.astype(float)
-    universe = reference.index.union(current.index)
-    reference = reference.reindex(universe, fill_value=0.0)
-    held = current.reindex(universe, fill_value=0.0)
-    names = industry.reindex(universe)
-    missing_industry = sorted(names.index[names.isna() & (reference.gt(0) | held.gt(0))])
-    if missing_industry:
-        return None, {"decision": "missing_industry", "missing_industry_count": len(missing_industry)}
-
-    suspended = quotes.suspended.reindex(universe).eq(True) & held.gt(0)
-    frozen = held.where(suspended, 0.0)
-    eligible = universe.isin(members) & quotes.isST.reindex(universe).eq(0) & quotes.suspended.reindex(universe).eq(False)
-    core = reference.where(eligible, 0.0)
-    top = scores.loc[scores.ts_code.isin(universe[eligible])].sort_values(
-        ["score", "ts_code"], ascending=[False, True],
-    ).head(50).ts_code.tolist()
-    if core.sum() <= 0 or len(top) != 50 or frozen.sum() >= 0.98:
-        return None, {"decision": "insufficient_eligible_stocks", "ranked_available": len(top)}
-    tilt = pd.Series(universe.isin(top), index=universe, dtype=float) / len(top)
-    available = 0.98 - frozen.sum()
-    base_sector = reference.groupby(names).sum()
-    limit = reference.clip(lower=0.04)
-    risk = returns.tail(60).reindex(columns=universe)
-    mandatory = ~universe.isin(members)
-    attempts = []
-    for enhancement in (0.20, 0.10, 0.0):
-        proposed = frozen + available * ((1 - enhancement) * core / core.sum() + enhancement * tilt)
-        active = proposed - reference
-        material = active.index[active.abs().gt(1e-12)]
-        active_returns = risk[material].dropna().dot(active.loc[material])
-        tracking_error = float(active_returns.std(ddof=1) * np.sqrt(252)) if len(active_returns) >= 40 else None
-        sector = float((proposed.groupby(names).sum() - base_sector).abs().max())
-        change = (proposed - held).where(~mandatory, 0)
-        turnover = float(max(change.clip(lower=0).sum(), -change.clip(upper=0).sum()))
-        checks = {"enhancement": enhancement, "tracking_error": tracking_error, "risk_sessions": len(active_returns),
-                  "industry_deviation": sector, "single_stock_excess": float((proposed - limit).max()),
-                  "turnover": turnover, "first_build": current.empty}
-        attempts.append(checks)
-        if (tracking_error is not None and tracking_error <= 0.08 and sector <= 0.05
-                and checks["single_stock_excess"] <= 1e-10 and (turnover <= 0.20 or current.empty)):
-            return proposed.loc[proposed.gt(0)].to_dict(), {"decision": "approved", **checks, "attempts": attempts}
-    return None, {"decision": "constraints_blocked", "attempts": attempts}
 
 
 def export(output, journal, settings):
